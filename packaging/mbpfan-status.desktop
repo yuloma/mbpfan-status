@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=mbpfan Status
+Comment=Show mbpfan service, fan RPM and CPU temperature in the top bar
+Exec=python3 %h/.local/bin/mbpfan-status
+Icon=utilities-system-monitor-symbolic
+Terminal=false
+Categories=System;Monitor;
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,7 @@
+{
+  "uuid": "mbpfan-status@local",
+  "name": "mbpfan Status",
+  "description": "Shows mbpfan service status, left/right fan RPM, and CPU temperature in the top bar.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}

@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""mbpfan tray widget for Ubuntu/GNOME (StatusNotifierItem + Ayatana label)."""
+
+from __future__ import annotations
+
+import glob
+import os
+import signal
+import subprocess
+from pathlib import Path
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gio, GLib, Gtk  # noqa: E402
+
+POLL_SECONDS = 2
+APP_ID = "mbpfan-status"
+BUS_NAME = "org.mbpfan.status"
+SNI_PATH = "/StatusNotifierItem"
+
+
+def read_text(path: str | Path) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def read_int(path: str | Path) -> int | None:
+    t = read_text(path)
+    if t is None:
+        return None
+    try:
+        return int(t)
+    except ValueError:
+        return None
+
+
+def applesmc_dir() -> Path | None:
+    matches = sorted(glob.glob("/sys/devices/platform/applesmc.*"))
+    return Path(matches[0]) if matches else None
+
+
+def coretemp_dir() -> Path | None:
+    for hw in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if read_text(Path(hw) / "name") == "coretemp":
+            return Path(hw)
+    return None
+
+
+def cpu_temp_c() -> tuple[int | None, str]:
+    hw = coretemp_dir()
+    if hw is not None:
+        best: tuple[int, str] | None = None
+        for inp in sorted(hw.glob("temp*_input")):
+            idx = inp.name[4:].split("_", 1)[0]
+            milli = read_int(inp)
+            if milli is None:
+                continue
+            c = round(milli / 1000)
+            label = read_text(hw / f"temp{idx}_label") or f"temp{idx}"
+            if "package" in label.lower():
+                return c, label
+            if best is None or c > best[0]:
+                best = (c, label)
+        if best:
+            return best
+
+    pkg = read_int("/sys/class/thermal/thermal_zone1/temp")
+    if pkg is not None:
+        return round(pkg / 1000), "pkg"
+    return None, "?"
+
+
+def fans(smc: Path | None) -> list[dict]:
+    out: list[dict] = []
+    if smc is None:
+        return out
+    for i in range(1, 5):
+        rpm = read_int(smc / f"fan{i}_input")
+        if rpm is None:
+            continue
+        out.append(
+            {
+                "label": read_text(smc / f"fan{i}_label") or f"fan{i}",
+                "rpm": rpm,
+                "target": read_int(smc / f"fan{i}_output"),
+                "manual": read_int(smc / f"fan{i}_manual"),
+            }
+        )
+    return out
+
+
+def fan_side(items: list[dict], side: str) -> dict | None:
+    needle = side.lower()
+    for f in items:
+        if needle in f["label"].lower():
+            return f
+    return None
+
+
+def mbpfan_active() -> bool:
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", "mbpfan"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+        return r.stdout.strip() == "active"
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+SNI_XML = f"""
+<node>
+  <interface name="org.kde.StatusNotifierItem">
+    <property name="Category" type="s" access="read"/>
+    <property name="Id" type="s" access="read"/>
+    <property name="Title" type="s" access="read"/>
+    <property name="Status" type="s" access="read"/>
+    <property name="WindowId" type="i" access="read"/>
+    <property name="IconName" type="s" access="read"/>
+    <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
+    <property name="ItemIsMenu" type="b" access="read"/>
+    <property name="Menu" type="o" access="read"/>
+    <property name="XAyatanaLabel" type="s" access="read"/>
+    <property name="XAyatanaLabelGuide" type="s" access="read"/>
+    <method name="Activate">
+      <arg direction="in" type="i" name="x"/>
+      <arg direction="in" type="i" name="y"/>
+    </method>
+    <method name="SecondaryActivate">
+      <arg direction="in" type="i" name="x"/>
+      <arg direction="in" type="i" name="y"/>
+    </method>
+    <method name="Scroll">
+      <arg direction="in" type="i" name="delta"/>
+      <arg direction="in" type="s" name="orientation"/>
+    </method>
+    <signal name="NewIcon"/>
+    <signal name="NewToolTip"/>
+    <signal name="NewStatus">
+      <arg type="s" name="status"/>
+    </signal>
+    <signal name="XAyatanaNewLabel">
+      <arg type="s" name="label"/>
+      <arg type="s" name="guide"/>
+    </signal>
+  </interface>
+</node>
+"""
+
+
+class MbpfanTray:
+    def __init__(self) -> None:
+        self._smc = applesmc_dir()
+        self._label = "mbpfan …"
+        self._guide = "○ L9999 R9999 99°"
+        self._tooltip = "mbpfan"
+        self._conn: Gio.DBusConnection | None = None
+        self._reg_id = 0
+        self._bus_name_id = 0
+        self._watcher_id = 0
+        self._menu = self._build_menu()
+
+        self._bus_name_id = Gio.bus_own_name(
+            Gio.BusType.SESSION,
+            BUS_NAME,
+            Gio.BusNameOwnerFlags.NONE,
+            self._on_bus_acquired,
+            None,
+            self._on_name_lost,
+        )
+        GLib.timeout_add_seconds(POLL_SECONDS, self._tick)
+        self._tick()
+
+    def _build_menu(self) -> Gtk.Menu:
+        menu = Gtk.Menu()
+        self._mi_svc = Gtk.MenuItem(label="Service: …")
+        self._mi_left = Gtk.MenuItem(label="Left: …")
+        self._mi_right = Gtk.MenuItem(label="Right: …")
+        self._mi_temp = Gtk.MenuItem(label="Temp: …")
+        self._mi_ctrl = Gtk.MenuItem(label="Control: …")
+        for mi in (
+            self._mi_svc,
+            self._mi_left,
+            self._mi_right,
+            self._mi_temp,
+            self._mi_ctrl,
+        ):
+            mi.set_sensitive(False)
+            menu.append(mi)
+
+        menu.append(Gtk.SeparatorMenuItem())
+        quit_i = Gtk.MenuItem(label="Quit")
+        quit_i.connect("activate", lambda *_: Gtk.main_quit())
+        menu.append(quit_i)
+        menu.show_all()
+        return menu
+
+    def _on_bus_acquired(self, connection: Gio.DBusConnection, _name: str) -> None:
+        self._conn = connection
+        self._reg_id = connection.register_object(
+            SNI_PATH,
+            Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0],
+            self._on_method,
+            self._on_get_property,
+            None,
+        )
+        self._register_with_watcher()
+
+    def _on_name_lost(self, _connection: Gio.DBusConnection, _name: str) -> None:
+        print("mbpfan-status: lost bus name", flush=True)
+        Gtk.main_quit()
+
+    def _register_with_watcher(self) -> None:
+        if self._conn is None:
+            return
+        # Ayatana/Ubuntu: pass object path; watcher uses the sender unique name.
+        try:
+            self._conn.call_sync(
+                "org.kde.StatusNotifierWatcher",
+                "/StatusNotifierWatcher",
+                "org.kde.StatusNotifierWatcher",
+                "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (SNI_PATH,)),
+                None,
+                Gio.DBusCallFlags.NONE,
+                -1,
+                None,
+            )
+        except GLib.Error as exc:
+            print(f"mbpfan-status: register failed: {exc}", flush=True)
+
+    def _on_method(self, _conn, _sender, _path, _iface, method, _params, invocation):
+        if method in ("Activate", "SecondaryActivate"):
+            self._menu.popup_at_pointer(None)
+        invocation.return_value(None)
+
+    def _on_get_property(self, _conn, _sender, _path, _iface, name):
+        mapping = {
+            "Category": GLib.Variant("s", "Hardware"),
+            "Id": GLib.Variant("s", APP_ID),
+            "Title": GLib.Variant("s", "mbpfan"),
+            "Status": GLib.Variant("s", "Active"),
+            "WindowId": GLib.Variant("i", 0),
+            "IconName": GLib.Variant("s", "utilities-system-monitor-symbolic"),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", "/"),
+            "XAyatanaLabel": GLib.Variant("s", self._label),
+            "XAyatanaLabelGuide": GLib.Variant("s", self._guide),
+            "ToolTip": GLib.Variant(
+                "(sa(iiay)ss)", ("", [], "mbpfan", self._tooltip)
+            ),
+        }
+        return mapping.get(name)
+
+    def _emit_label(self) -> None:
+        if self._conn is None:
+            return
+        self._conn.emit_signal(
+            None,
+            SNI_PATH,
+            "org.kde.StatusNotifierItem",
+            "XAyatanaNewLabel",
+            GLib.Variant("(ss)", (self._label, self._guide)),
+        )
+        self._conn.emit_signal(
+            None,
+            SNI_PATH,
+            "org.kde.StatusNotifierItem",
+            "NewToolTip",
+            None,
+        )
+
+    def _tick(self) -> bool:
+        active = mbpfan_active()
+        fl = fans(self._smc)
+        left = fan_side(fl, "left")
+        right = fan_side(fl, "right")
+        temp_c, temp_label = cpu_temp_c()
+
+        l = str(left["rpm"]) if left else "—"
+        r = str(right["rpm"]) if right else "—"
+        t = f"{temp_c}°" if temp_c is not None else "—"
+        mark = "●" if active else "○"
+        self._label = f"{mark} L{l} R{r} {t}"
+        self._guide = "○ L9999 R9999 99°"
+
+        self._mi_svc.set_label(
+            f"Service: mbpfan {'active' if active else 'inactive'}"
+        )
+        self._mi_left.set_label(
+            f"Left: {left['rpm']} rpm → {left['target']}"
+            if left
+            else "Left: n/a"
+        )
+        self._mi_right.set_label(
+            f"Right: {right['rpm']} rpm → {right['target']}"
+            if right
+            else "Right: n/a"
+        )
+        self._mi_temp.set_label(
+            f"Temp ({temp_label}): {temp_c}°C"
+            if temp_c is not None
+            else "Temp: n/a"
+        )
+        manual = (left or right or {}).get("manual")
+        if manual == 1:
+            ctrl = "mbpfan (manual)"
+        elif manual == 0:
+            ctrl = "firmware (auto)"
+        else:
+            ctrl = "unknown"
+        self._mi_ctrl.set_label(f"Control: {ctrl}")
+
+        self._tooltip = (
+            f"mbpfan {'active' if active else 'inactive'}\n"
+            f"Left {l} rpm | Right {r} rpm\n"
+            f"{temp_label} {t}"
+        )
+        self._emit_label()
+        return True
+
+
+def main() -> int:
+    signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
+    MbpfanTray()
+    Gtk.main()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
