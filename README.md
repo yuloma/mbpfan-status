@@ -10,6 +10,10 @@ Shows:
 
 Click the indicator for a short menu (service, RPM targets, control mode).
 
+![mbpfan-status in the Ubuntu GNOME top bar showing left/right fan RPM and CPU temperature](docs/top-bar-example.png)
+
+Example: `● L3676 R3680 61°` — service active, left/right fans, package temperature.
+
 ## Requirements
 
 - Ubuntu with GNOME and **Ubuntu AppIndicators** enabled
