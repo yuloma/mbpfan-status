@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import glob
-import os
 import signal
 import subprocess
 from pathlib import Path
@@ -12,12 +11,14 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "3.0")
-from gi.repository import Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Dbusmenu", "0.4")
+from gi.repository import Dbusmenu, Gio, GLib, Gtk  # noqa: E402
 
 POLL_SECONDS = 2
 APP_ID = "mbpfan-status"
 BUS_NAME = "org.mbpfan.status"
 SNI_PATH = "/StatusNotifierItem"
+MENU_PATH = "/com/canonical/dbusmenu"
 
 
 def read_text(path: str | Path) -> str | None:
@@ -114,7 +115,7 @@ def mbpfan_active() -> bool:
         return False
 
 
-SNI_XML = f"""
+SNI_XML = """
 <node>
   <interface name="org.kde.StatusNotifierItem">
     <property name="Category" type="s" access="read"/>
@@ -128,10 +129,6 @@ SNI_XML = f"""
     <property name="Menu" type="o" access="read"/>
     <property name="XAyatanaLabel" type="s" access="read"/>
     <property name="XAyatanaLabelGuide" type="s" access="read"/>
-    <method name="Activate">
-      <arg direction="in" type="i" name="x"/>
-      <arg direction="in" type="i" name="y"/>
-    </method>
     <method name="SecondaryActivate">
       <arg direction="in" type="i" name="x"/>
       <arg direction="in" type="i" name="y"/>
@@ -145,6 +142,7 @@ SNI_XML = f"""
     <signal name="NewStatus">
       <arg type="s" name="status"/>
     </signal>
+    <signal name="NewMenu"/>
     <signal name="XAyatanaNewLabel">
       <arg type="s" name="label"/>
       <arg type="s" name="guide"/>
@@ -152,6 +150,19 @@ SNI_XML = f"""
   </interface>
 </node>
 """
+
+
+def _info_item(label: str) -> Dbusmenu.Menuitem:
+    item = Dbusmenu.Menuitem.new()
+    item.property_set(Dbusmenu.MENUITEM_PROP_LABEL, label)
+    item.property_set_bool(Dbusmenu.MENUITEM_PROP_ENABLED, False)
+    return item
+
+
+def _separator() -> Dbusmenu.Menuitem:
+    item = Dbusmenu.Menuitem.new()
+    item.property_set(Dbusmenu.MENUITEM_PROP_TYPE, "separator")
+    return item
 
 
 class MbpfanTray:
@@ -163,8 +174,32 @@ class MbpfanTray:
         self._conn: Gio.DBusConnection | None = None
         self._reg_id = 0
         self._bus_name_id = 0
-        self._watcher_id = 0
-        self._menu = self._build_menu()
+
+        self._menu_server = Dbusmenu.Server.new(MENU_PATH)
+        self._menu_root = Dbusmenu.Menuitem.new()
+        self._mi_svc = _info_item("Service: …")
+        self._mi_left = _info_item("Left: …")
+        self._mi_right = _info_item("Right: …")
+        self._mi_temp = _info_item("Temp: …")
+        self._mi_ctrl = _info_item("Control: …")
+        self._mi_quit = Dbusmenu.Menuitem.new()
+        self._mi_quit.property_set(Dbusmenu.MENUITEM_PROP_LABEL, "Quit")
+        self._mi_quit.connect(
+            Dbusmenu.MENUITEM_SIGNAL_ITEM_ACTIVATED,
+            lambda *_: Gtk.main_quit(),
+        )
+
+        for child in (
+            self._mi_svc,
+            self._mi_left,
+            self._mi_right,
+            self._mi_temp,
+            self._mi_ctrl,
+            _separator(),
+            self._mi_quit,
+        ):
+            self._menu_root.child_append(child)
+        self._menu_server.set_root(self._menu_root)
 
         self._bus_name_id = Gio.bus_own_name(
             Gio.BusType.SESSION,
@@ -176,30 +211,6 @@ class MbpfanTray:
         )
         GLib.timeout_add_seconds(POLL_SECONDS, self._tick)
         self._tick()
-
-    def _build_menu(self) -> Gtk.Menu:
-        menu = Gtk.Menu()
-        self._mi_svc = Gtk.MenuItem(label="Service: …")
-        self._mi_left = Gtk.MenuItem(label="Left: …")
-        self._mi_right = Gtk.MenuItem(label="Right: …")
-        self._mi_temp = Gtk.MenuItem(label="Temp: …")
-        self._mi_ctrl = Gtk.MenuItem(label="Control: …")
-        for mi in (
-            self._mi_svc,
-            self._mi_left,
-            self._mi_right,
-            self._mi_temp,
-            self._mi_ctrl,
-        ):
-            mi.set_sensitive(False)
-            menu.append(mi)
-
-        menu.append(Gtk.SeparatorMenuItem())
-        quit_i = Gtk.MenuItem(label="Quit")
-        quit_i.connect("activate", lambda *_: Gtk.main_quit())
-        menu.append(quit_i)
-        menu.show_all()
-        return menu
 
     def _on_bus_acquired(self, connection: Gio.DBusConnection, _name: str) -> None:
         self._conn = connection
@@ -236,8 +247,7 @@ class MbpfanTray:
             print(f"mbpfan-status: register failed: {exc}", flush=True)
 
     def _on_method(self, _conn, _sender, _path, _iface, method, _params, invocation):
-        if method in ("Activate", "SecondaryActivate"):
-            self._menu.popup_at_pointer(None)
+        # Menu is owned by GNOME via DBusMenu; Activate is a no-op fallback.
         invocation.return_value(None)
 
     def _on_get_property(self, _conn, _sender, _path, _iface, name):
@@ -248,8 +258,8 @@ class MbpfanTray:
             "Status": GLib.Variant("s", "Active"),
             "WindowId": GLib.Variant("i", 0),
             "IconName": GLib.Variant("s", "utilities-system-monitor-symbolic"),
-            "ItemIsMenu": GLib.Variant("b", False),
-            "Menu": GLib.Variant("o", "/"),
+            "ItemIsMenu": GLib.Variant("b", True),
+            "Menu": GLib.Variant("o", MENU_PATH),
             "XAyatanaLabel": GLib.Variant("s", self._label),
             "XAyatanaLabelGuide": GLib.Variant("s", self._guide),
             "ToolTip": GLib.Variant(
@@ -276,6 +286,10 @@ class MbpfanTray:
             None,
         )
 
+    def _set_info(self, item: Dbusmenu.Menuitem, label: str) -> None:
+        item.property_set(Dbusmenu.MENUITEM_PROP_LABEL, label)
+        item.property_set_bool(Dbusmenu.MENUITEM_PROP_ENABLED, False)
+
     def _tick(self) -> bool:
         active = mbpfan_active()
         fl = fans(self._smc)
@@ -290,23 +304,25 @@ class MbpfanTray:
         self._label = f"{mark} L{l} R{r} {t}"
         self._guide = "○ L9999 R9999 99°"
 
-        self._mi_svc.set_label(
-            f"Service: mbpfan {'active' if active else 'inactive'}"
+        self._set_info(
+            self._mi_svc,
+            f"Service: mbpfan {'active' if active else 'inactive'}",
         )
-        self._mi_left.set_label(
-            f"Left: {left['rpm']} rpm → {left['target']}"
-            if left
-            else "Left: n/a"
+        self._set_info(
+            self._mi_left,
+            f"Left: {left['rpm']} rpm → {left['target']}" if left else "Left: n/a",
         )
-        self._mi_right.set_label(
+        self._set_info(
+            self._mi_right,
             f"Right: {right['rpm']} rpm → {right['target']}"
             if right
-            else "Right: n/a"
+            else "Right: n/a",
         )
-        self._mi_temp.set_label(
+        self._set_info(
+            self._mi_temp,
             f"Temp ({temp_label}): {temp_c}°C"
             if temp_c is not None
-            else "Temp: n/a"
+            else "Temp: n/a",
         )
         manual = (left or right or {}).get("manual")
         if manual == 1:
@@ -315,7 +331,7 @@ class MbpfanTray:
             ctrl = "firmware (auto)"
         else:
             ctrl = "unknown"
-        self._mi_ctrl.set_label(f"Control: {ctrl}")
+        self._set_info(self._mi_ctrl, f"Control: {ctrl}")
 
         self._tooltip = (
             f"mbpfan {'active' if active else 'inactive'}\n"

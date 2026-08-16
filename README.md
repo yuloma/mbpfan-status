@@ -19,10 +19,10 @@ Example: `● L3676 R3680 61°` — service active, left/right fans, package tem
 - Ubuntu with GNOME and **Ubuntu AppIndicators** enabled
 - `mbpfan` installed and running
 - Kernel modules `applesmc` + `coretemp`
-- Python 3 + PyGObject (`python3-gi`, Gtk 3)
+- Python 3 + PyGObject (`python3-gi`, Gtk 3, Dbusmenu)
 
 ```bash
-sudo apt install mbpfan python3-gi gir1.2-gtk-3.0
+sudo apt install mbpfan python3-gi gir1.2-gtk-3.0 gir1.2-dbusmenu-glib-0.4
 sudo systemctl enable --now mbpfan
 ```
 
