@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""mbpfan tray widget for Ubuntu/GNOME (StatusNotifierItem + Ayatana label)."""
+"""mbpfan tray/panel widget for GNOME (StatusNotifier) and XFCE (panel chip)."""
 
 from __future__ import annotations
 
+import configparser
 import glob
+import os
+import re
 import signal
 import subprocess
 from pathlib import Path
@@ -11,14 +14,47 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "3.0")
-gi.require_version("Dbusmenu", "0.4")
-from gi.repository import Dbusmenu, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("Gdk", "3.0")
+gi.require_version("PangoCairo", "1.0")
+import cairo  # noqa: E402
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
 POLL_SECONDS = 2
 APP_ID = "mbpfan-status"
 BUS_NAME = "org.mbpfan.status"
 SNI_PATH = "/StatusNotifierItem"
 MENU_PATH = "/com/canonical/dbusmenu"
+CONFIG_PATH = Path.home() / ".config" / "mbpfan-status" / "config.ini"
+
+_XFCE_DEFAULTS = {
+    "pager_reserve": 200,
+    "gap": 8,
+    "min_width": 190,
+    "height": 26,
+    "offset_x": 0,
+    "fallback_x": 900,
+}
+
+
+def load_xfce_config() -> dict[str, int]:
+    cfg = dict(_XFCE_DEFAULTS)
+    if not CONFIG_PATH.is_file():
+        return cfg
+    parser = configparser.ConfigParser()
+    parser.read(CONFIG_PATH)
+    if not parser.has_section("xfce"):
+        return cfg
+    for key in cfg:
+        cfg[key] = parser.getint("xfce", key, fallback=cfg[key])
+    return cfg
+
+
+def desktop_name() -> str:
+    return os.environ.get("XDG_CURRENT_DESKTOP", "").upper()
+
+
+def is_xfce() -> bool:
+    return "XFCE" in desktop_name()
 
 
 def read_text(path: str | Path) -> str | None:
@@ -115,6 +151,310 @@ def mbpfan_active() -> bool:
         return False
 
 
+def sample(smc: Path | None) -> dict:
+    active = mbpfan_active()
+    fl = fans(smc)
+    left = fan_side(fl, "left")
+    right = fan_side(fl, "right")
+    temp_c, temp_label = cpu_temp_c()
+    l = str(left["rpm"]) if left else "—"
+    r = str(right["rpm"]) if right else "—"
+    t = f"{temp_c}°" if temp_c is not None else "—"
+    mark = "●" if active else "○"
+    manual = (left or right or {}).get("manual")
+    if manual == 1:
+        ctrl = "mbpfan (manual)"
+    elif manual == 0:
+        ctrl = "firmware (auto)"
+    else:
+        ctrl = "unknown"
+    return {
+        "text": f"{mark} L{l} R{r} {t}",
+        "svc": f"Service: mbpfan {'active' if active else 'inactive'}",
+        "left": f"Left: {left['rpm']} rpm → {left['target']}" if left else "Left: n/a",
+        "right": f"Right: {right['rpm']} rpm → {right['target']}"
+        if right
+        else "Right: n/a",
+        "temp": f"Temp ({temp_label}): {temp_c}°C"
+        if temp_c is not None
+        else "Temp: n/a",
+        "ctrl": f"Control: {ctrl}",
+        "tooltip": (
+            f"mbpfan {'active' if active else 'inactive'}\n"
+            f"Left {l} rpm | Right {r} rpm\n"
+            f"{temp_label} {t}"
+        ),
+    }
+
+
+def build_gtk_menu() -> tuple[Gtk.Menu, dict[str, Gtk.MenuItem]]:
+    menu = Gtk.Menu()
+    items: dict[str, Gtk.MenuItem] = {}
+    for key, label in (
+        ("svc", "Service: …"),
+        ("left", "Left: …"),
+        ("right", "Right: …"),
+        ("temp", "Temp: …"),
+        ("ctrl", "Control: …"),
+    ):
+        mi = Gtk.MenuItem(label=label)
+        mi.set_sensitive(False)
+        menu.append(mi)
+        items[key] = mi
+    menu.append(Gtk.SeparatorMenuItem())
+    quit_i = Gtk.MenuItem(label="Quit")
+    quit_i.connect("activate", lambda *_: Gtk.main_quit())
+    menu.append(quit_i)
+    menu.show_all()
+    return menu, items
+
+
+def apply_menu(items: dict[str, Gtk.MenuItem], data: dict) -> None:
+    for key in ("svc", "left", "right", "temp", "ctrl"):
+        items[key].set_label(data[key])
+
+
+class XfcePanelChip:
+    """Reparent a text chip into xfce4-panel so it is a real bar widget, not a tray icon."""
+
+    def __init__(self, menu: Gtk.Menu) -> None:
+        self._menu = menu
+        self._win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        self._win.set_decorated(False)
+        self._win.set_resizable(False)
+        self._win.set_skip_taskbar_hint(True)
+        self._win.set_skip_pager_hint(True)
+        self._win.set_accept_focus(False)
+        self._win.set_type_hint(Gdk.WindowTypeHint.DOCK)
+
+        css = Gtk.CssProvider()
+        css.load_from_data(
+            b"""
+            window.mbpfan-chip { background-color: #2b2b2b; }
+            label.mbpfan-chip {
+              color: #eeeeee;
+              font-weight: 600;
+              font-size: 12px;
+              padding: 0 8px;
+            }
+            """
+        )
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+        self._win.get_style_context().add_class("mbpfan-chip")
+
+        box = Gtk.EventBox()
+        box.connect("button-press-event", self._on_click)
+        self._label = Gtk.Label(label="mbpfan …")
+        self._label.get_style_context().add_class("mbpfan-chip")
+        box.add(self._label)
+        self._win.add(box)
+        self._win.show_all()
+        self._reparented = False
+        self._cfg = load_xfce_config()
+        self._cfg_mtime: float | None = None
+        GLib.idle_add(self._attach)
+
+    def _refresh_cfg(self) -> dict[str, int]:
+        try:
+            mtime = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.is_file() else None
+        except OSError:
+            mtime = None
+        if mtime != self._cfg_mtime:
+            self._cfg = load_xfce_config()
+            self._cfg_mtime = mtime
+        return self._cfg
+
+    def _on_click(self, _w, event) -> bool:
+        if event.type == Gdk.EventType.BUTTON_PRESS and event.button in (1, 3):
+            self._menu.popup_at_pointer(event)
+            return True
+        return False
+
+    def _panel_xid(self) -> int | None:
+        try:
+            r = subprocess.run(
+                ["wmctrl", "-lG"], capture_output=True, text=True, check=False, timeout=1
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 7 and parts[-1] == "xfce4-panel":
+                try:
+                    w = int(parts[4])
+                    h = int(parts[5])
+                except ValueError:
+                    continue
+                if w >= 800 and h <= 40:
+                    return int(parts[0], 16)
+        return None
+
+    def _anchor_x(self, panel_xid: int, chip_w: int) -> int:
+        try:
+            r = subprocess.run(
+                ["xwininfo", "-id", hex(panel_xid), "-tree"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=1,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return self._cfg["fallback_x"]
+        xs: list[int] = []
+        for line in r.stdout.splitlines():
+            if "mbpfan" in line.lower():
+                continue
+            m = re.search(
+                r"(\d+)x(\d+)\+(\d+)\+(\d+)\s+\+(\d+)\+(\d+)", line
+            )
+            if not m:
+                continue
+            ww, hh, _rx, _ry, ax, ay = (int(g) for g in m.groups())
+            if ay == 0 and ax >= 200 and ww >= 40 and hh >= 20:
+                xs.append(ax)
+        cfg = self._refresh_cfg()
+        if xs:
+            # Pager has no X window; reserve space so the chip sits left of it.
+            return max(
+                0,
+                min(xs) - cfg["pager_reserve"] - chip_w - cfg["gap"] - cfg["offset_x"],
+            )
+        return cfg["fallback_x"]
+
+    def _attach(self) -> bool:
+        gi.require_version("GdkX11", "3.0")
+        from gi.repository import GdkX11  # noqa: PLC0415
+
+        self._win.realize()
+        child = self._win.get_window()
+        panel_xid = self._panel_xid()
+        if child is None or panel_xid is None:
+            return True
+        cfg = self._refresh_cfg()
+        height = cfg["height"]
+        self._label.set_size_request(-1, height)
+        _min, nat = self._win.get_preferred_size()
+        width = max(nat.width, cfg["min_width"])
+        self._win.set_size_request(width, height)
+        self._win.resize(width, height)
+        x = self._anchor_x(panel_xid, width)
+        display = Gdk.Display.get_default()
+        try:
+            parent = GdkX11.X11Window.foreign_new_for_display(display, panel_xid)
+            if parent is not None and not self._reparented:
+                child.reparent(parent, x, 0)
+                self._reparented = True
+            child.move_resize(x, 0, width, height)
+            child.show()
+            child.raise_()
+        except Exception as exc:
+            print(f"mbpfan-status: reparent failed: {exc}", flush=True)
+            child.set_override_redirect(True)
+            child.move_resize(x, 0, width, height)
+        return False
+
+    def update(self, text: str, tooltip: str) -> None:
+        self._label.set_text(text)
+        self._win.set_tooltip_text(tooltip)
+        gdk = self._win.get_window()
+        if gdk is None:
+            return
+        cfg = self._refresh_cfg()
+        _min, nat = self._win.get_preferred_size()
+        w = max(nat.width, cfg["min_width"])
+        h = cfg["height"]
+        panel_xid = self._panel_xid()
+        x = self._anchor_x(panel_xid, w) if panel_xid else cfg["fallback_x"]
+        gdk.move_resize(x, 0, w, h)
+        gdk.raise_()
+
+
+def _systray_plugin_path() -> str | None:
+    try:
+        r = subprocess.run(
+            ["xfconf-query", "-c", "xfce4-panel", "-l"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    for line in r.stdout.splitlines():
+        if not line.startswith("/plugins/plugin-") or line.count("/") != 2:
+            continue
+        got = subprocess.run(
+            ["xfconf-query", "-c", "xfce4-panel", "-p", line],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=1,
+        )
+        if got.stdout.strip() == "systray":
+            return line
+    return None
+
+
+def _prepare_xfce_systray() -> None:
+    base = _systray_plugin_path()
+    if not base:
+        return
+    for key, typ, val in (
+        (f"{base}/square-icons", "bool", "false"),
+        (f"{base}/hide-new-items", "bool", "false"),
+    ):
+        subprocess.run(
+            ["xfconf-query", "-c", "xfce4-panel", "-p", key, "-n", "-t", typ, "-s", val],
+            check=False,
+            timeout=2,
+            capture_output=True,
+        )
+
+
+def _text_surface(text: str) -> cairo.ImageSurface:
+    font = Pango.FontDescription("Sans 10")
+    tmp = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1)
+    cr = cairo.Context(tmp)
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(font)
+    layout.set_text(text, -1)
+    tw, th = layout.get_pixel_size()
+    pad_x, pad_y = 6, 3
+    w, h = max(tw + pad_x * 2, 8), max(th + pad_y * 2, 16)
+    surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, w, h)
+    cr = cairo.Context(surface)
+    cr.set_source_rgb(0.17, 0.17, 0.17)
+    cr.set_operator(cairo.OPERATOR_SOURCE)
+    cr.paint()
+    cr.set_operator(cairo.OPERATOR_OVER)
+    cr.set_source_rgb(0.93, 0.93, 0.93)
+    layout = PangoCairo.create_layout(cr)
+    layout.set_font_description(font)
+    layout.set_text(text, -1)
+    cr.move_to(pad_x, pad_y)
+    PangoCairo.show_layout(cr, layout)
+    return surface
+
+
+def _sni_icon_pixmap(surface: cairo.ImageSurface):
+    w, h = surface.get_width(), surface.get_height()
+    src = bytes(surface.get_data())
+    stride = surface.get_stride()
+    pixels = bytearray(w * h * 4)
+    o = 0
+    for y in range(h):
+        row = src[y * stride : y * stride + w * 4]
+        for x in range(0, w * 4, 4):
+            b, g, r, a = row[x : x + 4]
+            pixels[o : o + 4] = bytes((a, r, g, b))
+            o += 4
+    return [(w, h, bytes(pixels))]
+
+
 SNI_XML = """
 <node>
   <interface name="org.kde.StatusNotifierItem">
@@ -124,6 +464,7 @@ SNI_XML = """
     <property name="Status" type="s" access="read"/>
     <property name="WindowId" type="i" access="read"/>
     <property name="IconName" type="s" access="read"/>
+    <property name="IconPixmap" type="a(iiay)" access="read"/>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
     <property name="Menu" type="o" access="read"/>
@@ -152,69 +493,65 @@ SNI_XML = """
 """
 
 
-def _info_item(label: str) -> Dbusmenu.Menuitem:
-    item = Dbusmenu.Menuitem.new()
-    item.property_set(Dbusmenu.MENUITEM_PROP_LABEL, label)
-    item.property_set_bool(Dbusmenu.MENUITEM_PROP_ENABLED, False)
-    return item
-
-
-def _separator() -> Dbusmenu.Menuitem:
-    item = Dbusmenu.Menuitem.new()
-    item.property_set(Dbusmenu.MENUITEM_PROP_TYPE, "separator")
-    return item
-
-
-class MbpfanTray:
+class GnomeSni:
     def __init__(self) -> None:
-        self._smc = applesmc_dir()
+        gi.require_version("Dbusmenu", "0.4")
+        from gi.repository import Dbusmenu  # noqa: PLC0415
+
+        self._Dbusmenu = Dbusmenu
         self._label = "mbpfan …"
         self._guide = "○ L9999 R9999 99°"
         self._tooltip = "mbpfan"
+        self._icon_pixmap = _sni_icon_pixmap(_text_surface(self._label))
         self._conn: Gio.DBusConnection | None = None
-        self._reg_id = 0
-        self._bus_name_id = 0
+        self._registered = False
 
         self._menu_server = Dbusmenu.Server.new(MENU_PATH)
         self._menu_root = Dbusmenu.Menuitem.new()
-        self._mi_svc = _info_item("Service: …")
-        self._mi_left = _info_item("Left: …")
-        self._mi_right = _info_item("Right: …")
-        self._mi_temp = _info_item("Temp: …")
-        self._mi_ctrl = _info_item("Control: …")
-        self._mi_quit = Dbusmenu.Menuitem.new()
-        self._mi_quit.property_set(Dbusmenu.MENUITEM_PROP_LABEL, "Quit")
-        self._mi_quit.connect(
+        self._mi = {
+            "svc": self._info_item("Service: …"),
+            "left": self._info_item("Left: …"),
+            "right": self._info_item("Right: …"),
+            "temp": self._info_item("Temp: …"),
+            "ctrl": self._info_item("Control: …"),
+        }
+        quit_i = Dbusmenu.Menuitem.new()
+        quit_i.property_set(Dbusmenu.MENUITEM_PROP_LABEL, "Quit")
+        quit_i.connect(
             Dbusmenu.MENUITEM_SIGNAL_ITEM_ACTIVATED,
             lambda *_: Gtk.main_quit(),
         )
-
-        for child in (
-            self._mi_svc,
-            self._mi_left,
-            self._mi_right,
-            self._mi_temp,
-            self._mi_ctrl,
-            _separator(),
-            self._mi_quit,
-        ):
+        sep = Dbusmenu.Menuitem.new()
+        sep.property_set(Dbusmenu.MENUITEM_PROP_TYPE, "separator")
+        for child in (*self._mi.values(), sep, quit_i):
             self._menu_root.child_append(child)
         self._menu_server.set_root(self._menu_root)
 
-        self._bus_name_id = Gio.bus_own_name(
+        Gio.bus_own_name(
             Gio.BusType.SESSION,
             BUS_NAME,
             Gio.BusNameOwnerFlags.NONE,
             self._on_bus_acquired,
             None,
-            self._on_name_lost,
+            lambda *_: Gtk.main_quit(),
         )
-        GLib.timeout_add_seconds(POLL_SECONDS, self._tick)
-        self._tick()
+        Gio.bus_watch_name(
+            Gio.BusType.SESSION,
+            "org.kde.StatusNotifierWatcher",
+            Gio.BusNameWatcherFlags.NONE,
+            lambda *_: self._register_with_watcher(),
+            None,
+        )
+
+    def _info_item(self, label: str):
+        item = self._Dbusmenu.Menuitem.new()
+        item.property_set(self._Dbusmenu.MENUITEM_PROP_LABEL, label)
+        item.property_set_bool(self._Dbusmenu.MENUITEM_PROP_ENABLED, False)
+        return item
 
     def _on_bus_acquired(self, connection: Gio.DBusConnection, _name: str) -> None:
         self._conn = connection
-        self._reg_id = connection.register_object(
+        connection.register_object(
             SNI_PATH,
             Gio.DBusNodeInfo.new_for_xml(SNI_XML).interfaces[0],
             self._on_method,
@@ -223,14 +560,9 @@ class MbpfanTray:
         )
         self._register_with_watcher()
 
-    def _on_name_lost(self, _connection: Gio.DBusConnection, _name: str) -> None:
-        print("mbpfan-status: lost bus name", flush=True)
-        Gtk.main_quit()
-
-    def _register_with_watcher(self) -> None:
+    def _register_with_watcher(self, *_args) -> None:
         if self._conn is None:
             return
-        # Ayatana/Ubuntu: pass object path; watcher uses the sender unique name.
         try:
             self._conn.call_sync(
                 "org.kde.StatusNotifierWatcher",
@@ -240,14 +572,14 @@ class MbpfanTray:
                 GLib.Variant("(s)", (SNI_PATH,)),
                 None,
                 Gio.DBusCallFlags.NONE,
-                -1,
+                2000,
                 None,
             )
+            self._registered = True
         except GLib.Error as exc:
             print(f"mbpfan-status: register failed: {exc}", flush=True)
 
     def _on_method(self, _conn, _sender, _path, _iface, method, _params, invocation):
-        # Menu is owned by GNOME via DBusMenu; Activate is a no-op fallback.
         invocation.return_value(None)
 
     def _on_get_property(self, _conn, _sender, _path, _iface, name):
@@ -257,7 +589,8 @@ class MbpfanTray:
             "Title": GLib.Variant("s", "mbpfan"),
             "Status": GLib.Variant("s", "Active"),
             "WindowId": GLib.Variant("i", 0),
-            "IconName": GLib.Variant("s", "utilities-system-monitor-symbolic"),
+            "IconName": GLib.Variant("s", "" if is_xfce() else "utilities-system-monitor-symbolic"),
+            "IconPixmap": GLib.Variant("a(iiay)", self._icon_pixmap),
             "ItemIsMenu": GLib.Variant("b", True),
             "Menu": GLib.Variant("o", MENU_PATH),
             "XAyatanaLabel": GLib.Variant("s", self._label),
@@ -268,9 +601,38 @@ class MbpfanTray:
         }
         return mapping.get(name)
 
-    def _emit_label(self) -> None:
+    def update(self, data: dict) -> None:
+        Dbusmenu = self._Dbusmenu
+        self._label = data["text"]
+        self._tooltip = data["tooltip"]
+        self._icon_pixmap = _sni_icon_pixmap(_text_surface(self._label))
+        for key in ("svc", "left", "right", "temp", "ctrl"):
+            self._mi[key].property_set(Dbusmenu.MENUITEM_PROP_LABEL, data[key])
+            self._mi[key].property_set_bool(Dbusmenu.MENUITEM_PROP_ENABLED, False)
+        self._menu_server.set_root(self._menu_root)
         if self._conn is None:
             return
+        changed = {
+            "ToolTip": GLib.Variant(
+                "(sa(iiay)ss)", ("", [], "mbpfan", self._tooltip)
+            ),
+            "XAyatanaLabel": GLib.Variant("s", self._label),
+            "IconPixmap": GLib.Variant("a(iiay)", self._icon_pixmap),
+        }
+        self._conn.emit_signal(
+            None,
+            SNI_PATH,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            GLib.Variant("(sa{sv}as)", ("org.kde.StatusNotifierItem", changed, [])),
+        )
+        self._conn.emit_signal(
+            None,
+            SNI_PATH,
+            "org.kde.StatusNotifierItem",
+            "NewIcon",
+            None,
+        )
         self._conn.emit_signal(
             None,
             SNI_PATH,
@@ -286,65 +648,37 @@ class MbpfanTray:
             None,
         )
 
-    def _set_info(self, item: Dbusmenu.Menuitem, label: str) -> None:
-        item.property_set(Dbusmenu.MENUITEM_PROP_LABEL, label)
-        item.property_set_bool(Dbusmenu.MENUITEM_PROP_ENABLED, False)
+
+class MbpfanApp:
+    def __init__(self) -> None:
+        self._smc = applesmc_dir()
+        self._menu, self._menu_items = build_gtk_menu()
+        if is_xfce():
+            self._ui = XfcePanelChip(self._menu)
+            self._sni = None
+        else:
+            self._ui = None
+            self._sni = GnomeSni()
+        GLib.timeout_add_seconds(POLL_SECONDS, self._tick)
+        self._tick()
 
     def _tick(self) -> bool:
-        active = mbpfan_active()
-        fl = fans(self._smc)
-        left = fan_side(fl, "left")
-        right = fan_side(fl, "right")
-        temp_c, temp_label = cpu_temp_c()
-
-        l = str(left["rpm"]) if left else "—"
-        r = str(right["rpm"]) if right else "—"
-        t = f"{temp_c}°" if temp_c is not None else "—"
-        mark = "●" if active else "○"
-        self._label = f"{mark} L{l} R{r} {t}"
-        self._guide = "○ L9999 R9999 99°"
-
-        self._set_info(
-            self._mi_svc,
-            f"Service: mbpfan {'active' if active else 'inactive'}",
-        )
-        self._set_info(
-            self._mi_left,
-            f"Left: {left['rpm']} rpm → {left['target']}" if left else "Left: n/a",
-        )
-        self._set_info(
-            self._mi_right,
-            f"Right: {right['rpm']} rpm → {right['target']}"
-            if right
-            else "Right: n/a",
-        )
-        self._set_info(
-            self._mi_temp,
-            f"Temp ({temp_label}): {temp_c}°C"
-            if temp_c is not None
-            else "Temp: n/a",
-        )
-        manual = (left or right or {}).get("manual")
-        if manual == 1:
-            ctrl = "mbpfan (manual)"
-        elif manual == 0:
-            ctrl = "firmware (auto)"
-        else:
-            ctrl = "unknown"
-        self._set_info(self._mi_ctrl, f"Control: {ctrl}")
-
-        self._tooltip = (
-            f"mbpfan {'active' if active else 'inactive'}\n"
-            f"Left {l} rpm | Right {r} rpm\n"
-            f"{temp_label} {t}"
-        )
-        self._emit_label()
+        try:
+            data = sample(self._smc)
+            apply_menu(self._menu_items, data)
+            if self._ui is not None:
+                self._ui.update(data["text"], data["tooltip"])
+            if self._sni is not None:
+                self._sni.update(data)
+        except Exception as exc:
+            print(f"mbpfan-status: tick failed: {exc}", flush=True)
         return True
 
 
 def main() -> int:
+    GLib.set_prgname(APP_ID)
     signal.signal(signal.SIGINT, lambda *_: Gtk.main_quit())
-    MbpfanTray()
+    MbpfanApp()
     Gtk.main()
     return 0
 

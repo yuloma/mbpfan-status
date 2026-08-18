@@ -4,12 +4,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DST="${HOME}/.local/bin/mbpfan-status"
 AUTO_DST="${HOME}/.config/autostart/mbpfan-status.desktop"
+CFG_DST="${HOME}/.config/mbpfan-status/config.ini"
 EXT_DST="${HOME}/.local/share/gnome-shell/extensions/mbpfan-status@local"
 
 install_applet() {
-  mkdir -p "${HOME}/.local/bin" "${HOME}/.config/autostart"
+  mkdir -p "${HOME}/.local/bin" "${HOME}/.config/autostart" "$(dirname "${CFG_DST}")"
   install -m 0755 "${ROOT}/mbpfan-status" "${BIN_DST}"
   sed "s|%h|${HOME}|g" "${ROOT}/packaging/mbpfan-status.desktop" >"${AUTO_DST}"
+  if [[ ! -f "${CFG_DST}" ]]; then
+    install -m 0644 "${ROOT}/packaging/config.ini" "${CFG_DST}"
+    echo "Config          → ${CFG_DST}"
+  fi
   echo "Installed applet → ${BIN_DST}"
   echo "Autostart        → ${AUTO_DST}"
 }
